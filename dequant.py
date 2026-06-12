@@ -18,6 +18,9 @@ def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
 
     if qtype in TORCH_COMPATIBLE_QTYPES:
         return tensor.to(dtype)
+    elif qtype == gguf.GGMLQuantizationType.BF16:
+        tensor = torch.Tensor(tensor.data.view(torch.bfloat16).reshape(oshape))
+        return tensor if dtype is None or dtype == torch.bfloat16 else tensor.to(dtype)
     elif qtype in dequantize_functions:
         dequant_dtype = dtype if dequant_dtype == "target" else dequant_dtype
         return dequantize(tensor.data, qtype, oshape, dtype=dequant_dtype).to(dtype)

@@ -9,9 +9,22 @@ import os
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
+IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
+
+def device_supports_bf16():
+    """
+    Return True if the active torch device can run bf16 natively. On devices
+    without native bf16 support, computation silently falls back to fp32 which
+    is very slow, so callers should load tensors as fp16 instead.
+    """
+    try:
+        import comfy.model_management
+        return comfy.model_management.should_use_bf16(comfy.model_management.get_torch_device())
+    except Exception:
+        # If support can't be determined, keep the previous bf16 behavior.
+        return True
 
 def get_orig_shape(reader, tensor_name):
     field_key = f"comfy.gguf.orig_shape.{tensor_name}"
@@ -113,6 +126,9 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         logging.warning(f"Warning: This gguf model file is loaded in compatibility mode '{compat}' [arch:{arch_str}]")
 
     # main loading loop
+    # Devices without native bf16 fall back to slow fp32 compute, so load the
+    # full-precision BF16 storage tensors as fp16 there instead.
+    bf16_storage_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
     state_dict = {}
     qtype_dict = {}
     for sd_key, tensor in tensors:
@@ -138,9 +154,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             torch_tensor = torch_tensor.view(*shape)
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
-        # 1D tensors shouldn't be quantized, this is a fix for BF16
-        if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
-            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
+        # BF16 GGUF tensors are full-precision storage, not compressed quants.
+        if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+            dtype = torch.float32 if len(shape) <= 1 else bf16_storage_dtype
+            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=dtype)
 
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
@@ -501,6 +518,18 @@ def gguf_clip_loader(path):
         if arch == "qwen2vl":
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
+    elif arch == "ideogram":
+        # Dequantize Ideogram model for inference
+        logging.info("Dequantizing Ideogram model for inference...")
+        # Use BF16 to save VRAM while maintaining quality, but fall back to FP16
+        # on devices that don't support bf16 (avoids slow fp32 compute fallback).
+        target_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
+        dequantized_count = 0
+        for key in list(sd.keys()):
+            if is_quantized(sd[key]):
+                sd[key] = dequantize_tensor(sd[key], dtype=target_dtype)
+                dequantized_count += 1
+        logging.info(f"Dequantized {dequantized_count} tensors for Ideogram model ({target_dtype})")
     else:
         pass
     return sd
