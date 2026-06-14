@@ -81,8 +81,11 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     def pin_weight_to_device(self, key):
         op_key = key.rsplit('.', 1)[0]
         if not self.mmap_released and op_key in self.named_modules_to_munmap:
-            # TODO: possible to OOM, find better way to detach
-            self.named_modules_to_munmap[op_key].to(self.load_device).to(self.offload_device)
+            m = self.named_modules_to_munmap[op_key]
+            if hasattr(m, "weight") and m.weight is not None:
+                m.weight.data = torch.empty_like(m.weight.data).copy_(m.weight.data)
+            if hasattr(m, "bias") and m.bias is not None:
+                m.bias.data = torch.empty_like(m.bias.data).copy_(m.bias.data)
             del self.named_modules_to_munmap[op_key]
         super().pin_weight_to_device(key)
 

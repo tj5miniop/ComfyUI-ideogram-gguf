@@ -1,6 +1,8 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import warnings
 import logging
+
+from tqdm import tqdm
 import torch
 import gguf
 import re
@@ -8,6 +10,30 @@ import os
 
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
+
+# === DEBUGGING SETUP ===
+DEBUG_LOGS_ENABLED = True
+DEBUG_LOG_COUNT = 0
+DEBUG_LOG_LIMIT = 40
+
+def debug_k_quant_loader(tag, tensor_name, shape, qtype):
+    global DEBUG_LOG_COUNT
+    if not DEBUG_LOGS_ENABLED or DEBUG_LOG_COUNT >= DEBUG_LOG_LIMIT:
+        return
+
+    k_quants = [
+        gguf.GGMLQuantizationType.Q2_K,
+        gguf.GGMLQuantizationType.Q3_K,
+        gguf.GGMLQuantizationType.Q4_K,
+        gguf.GGMLQuantizationType.Q5_K,
+        gguf.GGMLQuantizationType.Q6_K
+    ]
+
+    if qtype in k_quants:
+        q_name = getattr(qtype, "name", repr(qtype))
+        logging.info(f"[DEBUG K-QUANT LOADER] {tag:<15} | {tensor_name} | shape: {list(shape)} | type: {q_name}")
+        DEBUG_LOG_COUNT += 1
+# =======================
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
@@ -79,6 +105,72 @@ def get_gguf_metadata(reader):
         except:
             continue
     return metadata
+
+
+def _plain_tensor(tensor):
+    if type(tensor) is torch.Tensor:
+        return tensor
+    try:
+        return tensor.as_subclass(torch.Tensor)
+    except AttributeError:
+        return torch.Tensor(tensor)
+
+
+def _as_float32_on_device(tensor, device):
+    tensor = tensor.to(device)
+    if is_quantized(tensor):
+        return dequantize_tensor(tensor, dtype=torch.float32)
+    return _plain_tensor(tensor.to(torch.float32))
+
+
+def _reshape_scale_for_weight(scale, weight):
+    if scale.ndim == 1 and weight.ndim > 1 and scale.shape[0] == weight.shape[0]:
+        return scale.reshape((scale.shape[0],) + (1,) * (weight.ndim - 1))
+    return scale
+
+
+def _fuse_weight_scale_tensors(state_dict):
+    scale_keys = [k for k in state_dict.keys() if k.endswith(".weight_scale")]
+    if not scale_keys:
+        return
+
+    import comfy.model_management
+
+    compute_device = comfy.model_management.get_torch_device()
+    storage_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
+    fused_count = 0
+
+    logging.info(f"Fusing {len(scale_keys)} GGUF weight scale tensors on {compute_device}.")
+    with torch.no_grad():
+        for scale_key in tqdm(scale_keys, desc="Fusing weight scales"):
+            weight_key = scale_key[:-len("_scale")]
+            if weight_key not in state_dict:
+                logging.warning(f"Skipping orphan GGUF weight scale tensor: {scale_key}")
+                del state_dict[scale_key]
+                continue
+
+            scale_float = _as_float32_on_device(state_dict[scale_key], compute_device)
+            weight_float = _as_float32_on_device(state_dict[weight_key], compute_device)
+            scale_float = _reshape_scale_for_weight(scale_float, weight_float)
+
+            try:
+                fused_weight = weight_float * scale_float
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Failed to fuse GGUF scale tensor {scale_key!r} with "
+                    f"{weight_key!r}: weight shape {tuple(weight_float.shape)}, "
+                    f"scale shape {tuple(scale_float.shape)}"
+                ) from e
+
+            fused_weight = fused_weight.to(device="cpu", dtype=storage_dtype)
+            state_dict[weight_key] = _plain_tensor(fused_weight)
+            del state_dict[scale_key]
+            del scale_float, weight_float, fused_weight
+            fused_count += 1
+
+    comfy.model_management.soft_empty_cache()
+    logging.info(f"Fused {fused_count} GGUF weight scale tensors into CPU {storage_dtype} weights.")
+
 
 def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False):
     """
@@ -158,6 +250,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
             dtype = torch.float32 if len(shape) <= 1 else bf16_storage_dtype
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=dtype)
+        elif len(shape) <= 1 and is_quantized(state_dict[sd_key]):
+            # Norm/scale parameters may use ops that are not GGML-aware. Keep
+            # these small tensors as plain floats so PyTorch can load them.
+            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
 
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
@@ -165,6 +261,8 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
 
     # print loaded tensor type counts
     logging.info("gguf qtypes: " + ", ".join(f"{k} ({v})" for k, v in qtype_dict.items()))
+
+    _fuse_weight_scale_tensors(state_dict)
 
     # mark largest tensor for vram estimation
     qsd = {k:v for k,v in state_dict.items() if is_quantized(v)}
@@ -463,10 +561,10 @@ def gguf_gemma3_tokenizer_loader(path):
     tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
     scores = get_list_field(reader, "tokenizer.ggml.scores", float)
     toktype = get_list_field(reader, "tokenizer.ggml.token_type", int)
-    
+
     if not tokens or not scores or not toktype:
         raise ValueError("Missing tokenizer metadata")
-    
+
     for idx in range(len(tokens)):
         piece = spm.SentencePiece()
         piece.piece = tokens[idx]
@@ -477,10 +575,10 @@ def gguf_gemma3_tokenizer_loader(path):
             piece.type = toktype[idx]
             piece.score = scores[idx]
         spm.pieces.append(piece)
-    
+
     spm.trainer_spec.vocab_size = len(spm.pieces)
     logging.info(f"Created tokenizer with vocab size of {len(spm.pieces)}")
-    
+
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
@@ -519,17 +617,19 @@ def gguf_clip_loader(path):
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
     elif arch == "ideogram":
-        # Dequantize Ideogram model for inference
-        logging.info("Dequantizing Ideogram model for inference...")
-        # Use BF16 to save VRAM while maintaining quality, but fall back to FP16
-        # on devices that don't support bf16 (avoids slow fp32 compute fallback).
-        target_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
-        dequantized_count = 0
-        for key in list(sd.keys()):
-            if is_quantized(sd[key]):
-                sd[key] = dequantize_tensor(sd[key], dtype=target_dtype)
-                dequantized_count += 1
-        logging.info(f"Dequantized {dequantized_count} tensors for Ideogram model ({target_dtype})")
+            # Dequantize Ideogram model for inference
+            logging.info("Dequantizing Ideogram model for inference...")
+            # Use BF16 to save VRAM while maintaining quality, but fall back to FP16
+            # on devices that don't support bf16 (avoids slow fp32 compute fallback).
+            from tqdm import tqdm
+            target_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
+            dequantized_count = 0
+
+            for key in tqdm(list(sd.keys()), desc="Dequantizing Tensors"):
+                if is_quantized(sd[key]):
+                    sd[key] = dequantize_tensor(sd[key], dtype=target_dtype)
+                    dequantized_count += 1
+            logging.info(f"Dequantized {dequantized_count} tensors for Ideogram model ({target_dtype})")
     else:
         pass
     return sd

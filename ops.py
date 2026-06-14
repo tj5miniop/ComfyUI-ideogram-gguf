@@ -8,17 +8,32 @@ import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
 
-def _valid_compute_dtype(dtype):
-    return dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+# === DEBUGGING SETUP ===
+DEBUG_LOGS_ENABLED = True
+DEBUG_LOG_COUNT = 0
+DEBUG_LOG_LIMIT = 40
 
-def _infer_compute_dtype(tensor_type, fallback=None):
-    if _valid_compute_dtype(fallback):
-        return fallback
-    if tensor_type == gguf.GGMLQuantizationType.BF16:
-        return torch.bfloat16
-    if tensor_type == gguf.GGMLQuantizationType.F32:
-        return torch.float32
-    return torch.float16
+def debug_k_quant_stats(tag, tensor, qtype):
+    global DEBUG_LOG_COUNT
+    if not DEBUG_LOGS_ENABLED or DEBUG_LOG_COUNT >= DEBUG_LOG_LIMIT:
+        return
+
+    k_quants = [
+        gguf.GGMLQuantizationType.Q2_K,
+        gguf.GGMLQuantizationType.Q3_K,
+        gguf.GGMLQuantizationType.Q4_K,
+        gguf.GGMLQuantizationType.Q5_K,
+        gguf.GGMLQuantizationType.Q6_K
+    ]
+
+    if qtype in k_quants and not tensor.is_meta:
+        has_nan = tensor.isnan().any().item()
+        has_inf = tensor.isinf().any().item()
+        t_min = tensor.min().item()
+        t_max = tensor.max().item()
+        logging.info(f"[DEBUG K-QUANT] {tag:<20} | min: {t_min: >9.4f} | max: {t_max: >9.4f} | NaNs: {has_nan} | Infs: {has_inf}")
+        DEBUG_LOG_COUNT += 1
+# =======================
 
 def chained_hasattr(obj, chained_attr):
     probe = obj
@@ -57,14 +72,13 @@ class GGMLTensor(torch.Tensor):
     """
     Main tensor-like class for storing quantized weights
     """
-    def __init__(self, *args, tensor_type, tensor_shape, patches=[], compute_dtype=None, **kwargs):
+    def __init__(self, *args, tensor_type, tensor_shape, patches=[], **kwargs):
         super().__init__()
         self.tensor_type = tensor_type
         self.tensor_shape = tensor_shape
         self.patches = patches
-        self.compute_dtype = compute_dtype
 
-    def __new__(cls, *args, tensor_type, tensor_shape, patches=[], compute_dtype=None, **kwargs):
+    def __new__(cls, *args, tensor_type, tensor_shape, patches=[], **kwargs):
         return super().__new__(cls, *args, **kwargs)
 
     def to(self, *args, **kwargs):
@@ -72,7 +86,6 @@ class GGMLTensor(torch.Tensor):
         new.tensor_type = getattr(self, "tensor_type", None)
         new.tensor_shape = getattr(self, "tensor_shape", new.data.shape)
         new.patches = getattr(self, "patches", []).copy()
-        new.compute_dtype = getattr(self, "compute_dtype", None)
         return new
 
     def clone(self, *args, **kwargs):
@@ -95,16 +108,8 @@ class GGMLTensor(torch.Tensor):
                 new_tensor,
                 tensor_type = getattr(self, "tensor_type", None),
                 tensor_shape = size,
-                patches = getattr(self, "patches", []).copy(),
-                compute_dtype = getattr(self, "compute_dtype", None),
+                patches = getattr(self, "patches", []).copy()
         )
-
-    @property
-    def dtype(self):
-        qtype = getattr(self, "tensor_type", None)
-        if qtype in GGMLLayer.torch_compatible_tensor_types:
-            return torch.Tensor(self).dtype
-        return _infer_compute_dtype(qtype, getattr(self, "compute_dtype", None))
 
     @property
     def shape(self):
@@ -143,31 +148,11 @@ class GGMLLayer(torch.nn.Module):
         prefix_len = len(prefix)
         for k,v in state_dict.items():
             if k[prefix_len:] == "weight":
-                if isinstance(v, GGMLTensor):
-                    v.compute_dtype = self._ggml_compute_dtype(v, "weight")
                 self.weight = torch.nn.Parameter(v, requires_grad=False)
             elif k[prefix_len:] == "bias" and v is not None:
-                if isinstance(v, GGMLTensor):
-                    v.compute_dtype = self._ggml_compute_dtype(v, "bias")
                 self.bias = torch.nn.Parameter(v, requires_grad=False)
             else:
                 unexpected_keys.append(k)
-
-        # For Linear layer with missing weight
-        if self.weight is None and isinstance(self, torch.nn.Linear):
-            v = torch.zeros(self.in_features, self.out_features)
-            self.weight = torch.nn.Parameter(v, requires_grad=False)
-            missing_keys.append(prefix+"weight")
-
-        # for vram estimation (TODO: less fragile logic?)
-        if getattr(self.weight, "is_largest_weight", False):
-            self.largest_layer = True
-
-    def _ggml_compute_dtype(self, tensor, param_name):
-        if self.dequant_dtype is not None and self.dequant_dtype != "target":
-            return self.dequant_dtype
-        model_dtype = getattr(self, f"{param_name}_comfy_model_dtype", None)
-        return _infer_compute_dtype(getattr(tensor, "tensor_type", None), model_dtype)
 
     def _save_to_state_dict(self, *args, **kwargs):
         if self.is_ggml_quantized():
@@ -207,6 +192,7 @@ class GGMLLayer(torch.nn.Module):
 
         # dequantize tensor while patches load
         weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
+        qtype = getattr(tensor, "tensor_type", None)
 
         # prevent propagating custom tensor class
         if isinstance(weight, GGMLTensor):
@@ -220,6 +206,9 @@ class GGMLLayer(torch.nn.Module):
                 # for testing, may degrade image quality
                 patch_dtype = dtype if self.patch_dtype == "target" else self.patch_dtype
                 weight = comfy.lora.calculate_weight(patch_list, weight, key, patch_dtype)
+
+            debug_k_quant_stats("post_lora_patch", weight, qtype)
+
         return weight
 
     @torch_compiler_disable()
@@ -240,6 +229,10 @@ class GGMLLayer(torch.nn.Module):
 
         weight = s.get_weight(s.weight.to(device), dtype)
         weight = comfy.ops.cast_to(weight, dtype, device, non_blocking=non_blocking, copy=False)
+
+        qtype = getattr(s.weight, "tensor_type", None)
+        debug_k_quant_stats("post_final_cast", weight, qtype)
+
         return weight, bias
 
     def forward_comfy_cast_weights(self, input, *args, **kwargs):
@@ -270,8 +263,6 @@ class GGMLOps(comfy.ops.manual_cast):
             self.out_features = out_features
             self.weight = None
             self.bias = None
-            self.weight_comfy_model_dtype = dtype
-            self.bias_comfy_model_dtype = dtype
 
         def forward_ggml_cast_weights(self, input):
             weight, bias = self.cast_bias_weight(input)
