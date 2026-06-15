@@ -88,34 +88,7 @@ K-quants are intentionally rejected before loading:
 
 Those formats need fused quantized linear kernels to be fast. This node pack dequantizes for PyTorch operations, so K-quants are slow and memory-heavy in this path. Use non-K files such as `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, or `Q8_0`.
 
-## Ideogram 4 GGUF
-
-Ideogram 4 support in this fork is intended for the non-K GGUF files published here:
-
-- [molbal/ideogram-4-gguf](https://huggingface.co/molbal/ideogram-4-gguf)
-
-Ideogram 4 uses two diffusion model components:
-
-| Component | File pattern | Purpose |
-| --- | --- | --- |
-| Main transformer | `ideogram4-transformer-*.gguf` | Text-guided diffusion model |
-| Unconditional transformer | `ideogram4-unconditional_transformer-*.gguf` | Unconditional/CFG counterpart |
-
-Place both files in `models/diffusion_models` or `models/unet`, then load them with `Unet Loader (GGUF)` or `Unet Loader (GGUF/Advanced)` in an Ideogram 4 workflow that accepts separate main and unconditional diffusion models.
-
-The main and unconditional model do not have to use the same quant level. Common pairings:
-
-| Main transformer | Unconditional transformer | Notes |
-| --- | --- | --- |
-| `q8_0` | `q8_0` | Highest quality baseline |
-| `q8_0` | `q4_0` | Saves memory mostly on the CFG side |
-| `q5_1` | `q4_1` | Balanced quality and size |
-| `q5_0` | `q4_0` | Lower memory starting point |
-| `q4_0` | `q4_0` | Smallest available pair |
-
-The GGUF files are only the diffusion transformers. Your workflow still needs the other Ideogram 4 runtime assets expected by ComfyUI, such as the text encoder or multimodal encoder and VAE.
-
-## Other Pre-Quantized Models
+## Pre-Quantized Models
 
 Upstream ComfyUI-GGUF model repositories may still be useful when the files use tensor types supported by this fork:
 
@@ -124,16 +97,17 @@ Upstream ComfyUI-GGUF model repositories may still be useful when the files use 
 - [city96/stable-diffusion-3.5-large-gguf](https://huggingface.co/city96/stable-diffusion-3.5-large-gguf)
 - [city96/stable-diffusion-3.5-large-turbo-gguf](https://huggingface.co/city96/stable-diffusion-3.5-large-turbo-gguf)
 - [city96/t5-v1_1-xxl-encoder-gguf](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
+- [molbal/ideogram-4-gguf](https://huggingface.co/molbal/ideogram-4-gguf)
 
 If a model fails immediately with an unsupported K-quant error, use a non-K variant instead.
 
 ## LoRA Notes
 
-LoRA loading is experimental with quantized GGUF weights, but the built-in ComfyUI LoRA loader nodes should work for supported model families. The advanced loader can move patches to the model load device before applying them when needed.
+LoRA loading is supported with quantized GGUF weights, the built-in ComfyUI LoRA loader nodes work for supported model families. The advanced loader can move patches to the model load device before applying them when needed.
 
 ## Conversion
 
-The `tools` directory contains helper scripts for creating GGUF files from model weights. For Ideogram 4, the published files were converted from the original FP8 checkpoint by expanding FP8 scaled weights to BF16 and then converting/quantizing with [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
+The `tools` directory contains helper scripts for creating GGUF files from model weights.
 
 For best compatibility with this fork, produce non-K quant types: `q4_0`, `q4_1`, `q5_0`, `q5_1`, or `q8_0`.
 
