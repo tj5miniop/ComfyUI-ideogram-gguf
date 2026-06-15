@@ -2,8 +2,8 @@
 *.gguf
 *.safetensors
 tools/llama.cpp*
-.idea
-
+.idea/
+fp8/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -171,3 +171,8 @@ cython_debug/
 /.venv/
 /fp8/
 /fp8/
+/fp8/unconditional_transformer/
+/fp8/unconditional_transformer/config.json
+/fp8/unconditional_transformer/diffusion_pytorch_model.safetensors.index.json
+/fp8/transformer/config.json
+/fp8/transformer/diffusion_pytorch_model.safetensors.index.json
