@@ -1,49 +1,142 @@
 # ComfyUI-GGUF
-GGUF Quantization support for native ComfyUI models
 
-This is currently very much WIP. These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
+GGUF loader nodes for native ComfyUI diffusion models and text encoders.
 
-While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
+This fork focuses on loading non-K GGUF quantized transformer/DiT models through ComfyUI's normal model patching path, with added support for Ideogram-style GGUF diffusion models.
 
-![Comfy_Flux1_dev_Q4_0_GGUF_1024](https://github.com/user-attachments/assets/70d16d97-c522-4ef4-9435-633f128644c8)
-
-Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not install it if you only have one GPU. Do not set it to cuda:0 then complain about OOM errors if you do not undestand what it is for. There is not need to copy the workflow above, just use your own workflow and replace the stock "Load Diffusion Model" with the "Unet Loader (GGUF)" node.
+GGUF is the model file format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp). It is useful for transformer-heavy diffusion models where quantized linear weights can reduce storage and VRAM use.
 
 ## Installation
 
-> [!IMPORTANT]  
-> Make sure your ComfyUI is on a recent-enough version to support custom ops when loading the UNET-only.
+Install this fork into your ComfyUI custom nodes directory:
 
-To install the custom node normally, git clone this repository into your custom nodes folder (`ComfyUI/custom_nodes`) and install the only dependency for inference (`pip install --upgrade gguf`)
-
-```
-git clone https://github.com/city96/ComfyUI-GGUF
+```bash
+git clone https://github.com/molbal/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
 ```
 
-To install the custom node on a standalone ComfyUI release, open a CMD inside the "ComfyUI_windows_portable" folder (where your `run_nvidia_gpu.bat` file is) and use the following commands:
+Then install the requirements in the same Python environment that runs ComfyUI:
 
+```bash
+pip install -r ComfyUI/custom_nodes/ComfyUI-GGUF/requirements.txt
 ```
-git clone https://github.com/city96/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
+
+For ComfyUI portable on Windows, run this from the portable root folder:
+
+```bat
+git clone https://github.com/molbal/ComfyUI-GGUF ComfyUI\custom_nodes\ComfyUI-GGUF
 .\python_embeded\python.exe -s -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-GGUF\requirements.txt
 ```
 
-On MacOS sequoia, torch 2.4.1 seems to be required, as 2.6.X nightly versions cause a "M1 buffer is not large enough" error. See [this issue](https://github.com/city96/ComfyUI-GGUF/issues/107) for more information/workarounds.
+Restart ComfyUI after installation or update.
 
-## Usage
+## Nodes
 
-Simply use the GGUF Unet loader found under the `bootleg` category. Place the .gguf model files in your `ComfyUI/models/unet` folder.
+The loader nodes are in the `bootleg` category.
 
-LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).
+Diffusion model loaders:
 
-Pre-quantized models:
+- `Unet Loader (GGUF)`
+- `Unet Loader (GGUF/Advanced)`
 
-- [flux1-dev GGUF](https://huggingface.co/city96/FLUX.1-dev-gguf)
-- [flux1-schnell GGUF](https://huggingface.co/city96/FLUX.1-schnell-gguf)
-- [stable-diffusion-3.5-large GGUF](https://huggingface.co/city96/stable-diffusion-3.5-large-gguf)
-- [stable-diffusion-3.5-large-turbo GGUF](https://huggingface.co/city96/stable-diffusion-3.5-large-turbo-gguf)
+Text encoder loaders:
 
-Initial support for quantizing T5 has also been added recently, these can be used using the various `*CLIPLoader (gguf)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.
+- `CLIPLoader (GGUF)`
+- `DualCLIPLoader (GGUF)`
+- `TripleCLIPLoader (GGUF)`
+- `QuadrupleCLIPLoader (GGUF)`
 
-- [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
+The advanced UNet loader exposes explicit dtype controls for dequantization and patch application. Use the defaults unless you are benchmarking or debugging.
 
-See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
+## Model Folders
+
+Diffusion `.gguf` files are discovered from ComfyUI diffusion model folders:
+
+```text
+ComfyUI/models/diffusion_models/
+ComfyUI/models/unet/
+```
+
+Text encoder `.gguf` files are discovered from:
+
+```text
+ComfyUI/models/text_encoders/
+ComfyUI/models/clip/
+```
+
+## Supported GGUF Tensor Types
+
+This fork supports GGUF tensor types that can be handled by the PyTorch dequantization path:
+
+- `F32`
+- `F16`
+- `BF16`
+- `Q4_0`
+- `Q4_1`
+- `Q5_0`
+- `Q5_1`
+- `Q8_0`
+- `IQ4_NL`
+- `IQ4_XS`
+
+K-quants are intentionally rejected before loading:
+
+- `Q2_K`
+- `Q3_K`
+- `Q4_K`
+- `Q5_K`
+- `Q6_K`
+
+Those formats need fused quantized linear kernels to be fast. This node pack dequantizes for PyTorch operations, so K-quants are slow and memory-heavy in this path. Use non-K files such as `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, or `Q8_0`.
+
+## Ideogram 4 GGUF
+
+Ideogram 4 support in this fork is intended for the non-K GGUF files published here:
+
+- [molbal/ideogram-4-gguf](https://huggingface.co/molbal/ideogram-4-gguf)
+
+Ideogram 4 uses two diffusion model components:
+
+| Component | File pattern | Purpose |
+| --- | --- | --- |
+| Main transformer | `ideogram4-transformer-*.gguf` | Text-guided diffusion model |
+| Unconditional transformer | `ideogram4-unconditional_transformer-*.gguf` | Unconditional/CFG counterpart |
+
+Place both files in `models/diffusion_models` or `models/unet`, then load them with `Unet Loader (GGUF)` or `Unet Loader (GGUF/Advanced)` in an Ideogram 4 workflow that accepts separate main and unconditional diffusion models.
+
+The main and unconditional model do not have to use the same quant level. Common pairings:
+
+| Main transformer | Unconditional transformer | Notes |
+| --- | --- | --- |
+| `q8_0` | `q8_0` | Highest quality baseline |
+| `q8_0` | `q4_0` | Saves memory mostly on the CFG side |
+| `q5_1` | `q4_1` | Balanced quality and size |
+| `q5_0` | `q4_0` | Lower memory starting point |
+| `q4_0` | `q4_0` | Smallest available pair |
+
+The GGUF files are only the diffusion transformers. Your workflow still needs the other Ideogram 4 runtime assets expected by ComfyUI, such as the text encoder or multimodal encoder and VAE.
+
+## Other Pre-Quantized Models
+
+Upstream ComfyUI-GGUF model repositories may still be useful when the files use tensor types supported by this fork:
+
+- [city96/FLUX.1-dev-gguf](https://huggingface.co/city96/FLUX.1-dev-gguf)
+- [city96/FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf)
+- [city96/stable-diffusion-3.5-large-gguf](https://huggingface.co/city96/stable-diffusion-3.5-large-gguf)
+- [city96/stable-diffusion-3.5-large-turbo-gguf](https://huggingface.co/city96/stable-diffusion-3.5-large-turbo-gguf)
+- [city96/t5-v1_1-xxl-encoder-gguf](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
+
+If a model fails immediately with an unsupported K-quant error, use a non-K variant instead.
+
+## LoRA Notes
+
+LoRA loading is experimental with quantized GGUF weights, but the built-in ComfyUI LoRA loader nodes should work for supported model families. The advanced loader can move patches to the model load device before applying them when needed.
+
+## Conversion
+
+The `tools` directory contains helper scripts for creating GGUF files from model weights. For Ideogram 4, the published files were converted from the original FP8 checkpoint by expanding FP8 scaled weights to BF16 and then converting/quantizing with [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
+
+For best compatibility with this fork, produce non-K quant types: `q4_0`, `q4_1`, `q5_0`, `q5_1`, or `q8_0`.
+
+## Credits
+
+This fork builds on the original [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) project and the GGUF/GGML ecosystem.

@@ -14,7 +14,7 @@ import comfy.model_management
 import folder_paths
 
 from .ops import GGMLOps, move_patch_to_device
-from .loader import gguf_sd_loader, gguf_clip_loader
+from .loader import device_supports_bf16, gguf_sd_loader, gguf_clip_loader
 from .dequant import is_quantized, is_torch_compatible
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -34,6 +34,12 @@ update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
+
+    def detach_module_from_mmap(self, module):
+        for attr in ("weight", "bias"):
+            tensor = getattr(module, attr, None)
+            if tensor is not None and getattr(tensor, "device", None) == self.offload_device:
+                tensor.data = torch.empty_like(tensor.data, device=self.offload_device).copy_(tensor.data)
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
@@ -81,11 +87,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     def pin_weight_to_device(self, key):
         op_key = key.rsplit('.', 1)[0]
         if not self.mmap_released and op_key in self.named_modules_to_munmap:
-            m = self.named_modules_to_munmap[op_key]
-            if hasattr(m, "weight") and m.weight is not None:
-                m.weight.data = torch.empty_like(m.weight.data).copy_(m.weight.data)
-            if hasattr(m, "bias") and m.bias is not None:
-                m.bias.data = torch.empty_like(m.bias.data).copy_(m.bias.data)
+            self.detach_module_from_mmap(self.named_modules_to_munmap[op_key])
             del self.named_modules_to_munmap[op_key]
         super().pin_weight_to_device(key)
 
@@ -117,8 +119,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             if linked and self.load_device != self.offload_device:
                 logging.info(f"Attempting to release mmap ({len(linked)})")
                 for n, m in linked:
-                    # TODO: possible to OOM, find better way to detach
-                    m.to(self.load_device).to(self.offload_device)
+                    self.detach_module_from_mmap(m)
             self.mmap_released = True
             self.named_modules_to_munmap = {}
 
@@ -176,8 +177,13 @@ class UnetLoaderGGUF:
         if "metadata" in valid_params:
             kwargs["metadata"] = extra.get("metadata", {})
 
+        model_options = {"custom_operations": ops}
+        if not device_supports_bf16():
+            logging.info("ComfyUI-GGUF: using FP16 diffusion dtype because fast BF16 is not available on this device.")
+            model_options["dtype"] = torch.float16
+
         model = comfy.sd.load_diffusion_model_state_dict(
-            sd, model_options={"custom_operations": ops}, **kwargs,
+            sd, model_options=model_options, **kwargs,
         )
         if model is None:
             logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))

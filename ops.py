@@ -8,33 +8,6 @@ import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
 
-# === DEBUGGING SETUP ===
-DEBUG_LOGS_ENABLED = True
-DEBUG_LOG_COUNT = 0
-DEBUG_LOG_LIMIT = 40
-
-def debug_k_quant_stats(tag, tensor, qtype):
-    global DEBUG_LOG_COUNT
-    if not DEBUG_LOGS_ENABLED or DEBUG_LOG_COUNT >= DEBUG_LOG_LIMIT:
-        return
-
-    k_quants = [
-        gguf.GGMLQuantizationType.Q2_K,
-        gguf.GGMLQuantizationType.Q3_K,
-        gguf.GGMLQuantizationType.Q4_K,
-        gguf.GGMLQuantizationType.Q5_K,
-        gguf.GGMLQuantizationType.Q6_K
-    ]
-
-    if qtype in k_quants and not tensor.is_meta:
-        has_nan = tensor.isnan().any().item()
-        has_inf = tensor.isinf().any().item()
-        t_min = tensor.min().item()
-        t_max = tensor.max().item()
-        logging.info(f"[DEBUG K-QUANT] {tag:<20} | min: {t_min: >9.4f} | max: {t_max: >9.4f} | NaNs: {has_nan} | Infs: {has_inf}")
-        DEBUG_LOG_COUNT += 1
-# =======================
-
 def chained_hasattr(obj, chained_attr):
     probe = obj
     for attr in chained_attr.split('.'):
@@ -192,7 +165,6 @@ class GGMLLayer(torch.nn.Module):
 
         # dequantize tensor while patches load
         weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
-        qtype = getattr(tensor, "tensor_type", None)
 
         # prevent propagating custom tensor class
         if isinstance(weight, GGMLTensor):
@@ -206,8 +178,6 @@ class GGMLLayer(torch.nn.Module):
                 # for testing, may degrade image quality
                 patch_dtype = dtype if self.patch_dtype == "target" else self.patch_dtype
                 weight = comfy.lora.calculate_weight(patch_list, weight, key, patch_dtype)
-
-            debug_k_quant_stats("post_lora_patch", weight, qtype)
 
         return weight
 
@@ -229,9 +199,6 @@ class GGMLLayer(torch.nn.Module):
 
         weight = s.get_weight(s.weight.to(device), dtype)
         weight = comfy.ops.cast_to(weight, dtype, device, non_blocking=non_blocking, copy=False)
-
-        qtype = getattr(s.weight, "tensor_type", None)
-        debug_k_quant_stats("post_final_cast", weight, qtype)
 
         return weight, bias
 

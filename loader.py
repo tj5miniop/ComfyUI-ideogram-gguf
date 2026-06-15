@@ -9,31 +9,7 @@ import re
 import os
 
 from .ops import GGMLTensor
-from .dequant import is_quantized, dequantize_tensor
-
-# === DEBUGGING SETUP ===
-DEBUG_LOGS_ENABLED = True
-DEBUG_LOG_COUNT = 0
-DEBUG_LOG_LIMIT = 40
-
-def debug_k_quant_loader(tag, tensor_name, shape, qtype):
-    global DEBUG_LOG_COUNT
-    if not DEBUG_LOGS_ENABLED or DEBUG_LOG_COUNT >= DEBUG_LOG_LIMIT:
-        return
-
-    k_quants = [
-        gguf.GGMLQuantizationType.Q2_K,
-        gguf.GGMLQuantizationType.Q3_K,
-        gguf.GGMLQuantizationType.Q4_K,
-        gguf.GGMLQuantizationType.Q5_K,
-        gguf.GGMLQuantizationType.Q6_K
-    ]
-
-    if qtype in k_quants:
-        q_name = getattr(qtype, "name", repr(qtype))
-        logging.info(f"[DEBUG K-QUANT LOADER] {tag:<15} | {tensor_name} | shape: {list(shape)} | type: {q_name}")
-        DEBUG_LOG_COUNT += 1
-# =======================
+from .dequant import UNSUPPORTED_K_QUANT_TYPES, is_quantized, dequantize_tensor, qtype_name
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ideogram"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
@@ -41,16 +17,33 @@ VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def device_supports_bf16():
     """
-    Return True if the active torch device can run bf16 natively. On devices
-    without native bf16 support, computation silently falls back to fp32 which
-    is very slow, so callers should load tensors as fp16 instead.
+    Return True if the active torch device can run BF16 efficiently. Some
+    consumer Ampere GPUs report BF16 support through PyTorch/Comfy but route
+    model execution through FP32 manual casts, which is much slower. Keep this
+    stricter than Comfy's generic helper for GGUF tensor loading.
     """
     try:
         import comfy.model_management
-        return comfy.model_management.should_use_bf16(comfy.model_management.get_torch_device())
+        device = torch.device(comfy.model_management.get_torch_device())
+        if device.type != "cuda":
+            return comfy.model_management.should_use_bf16(device)
+
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(index)
+        name = torch.cuda.get_device_name(index).lower()
+
+        # Native fast BF16 is available on GA100/A100-class Ampere, Ada, Hopper,
+        # and newer architectures. GA10x Ampere cards such as RTX 30xx expose
+        # BF16 in some software paths but are slow for this workload.
+        if major >= 9:
+            return True
+        if (major, minor) >= (8, 9):
+            return True
+        if (major, minor) == (8, 0) and ("a100" in name or "a800" in name):
+            return True
+        return False
     except Exception:
-        # If support can't be determined, keep the previous bf16 behavior.
-        return True
+        return False
 
 def get_orig_shape(reader, tensor_name):
     field_key = f"comfy.gguf.orig_shape.{tensor_name}"
@@ -107,6 +100,40 @@ def get_gguf_metadata(reader):
     return metadata
 
 
+def _raise_for_unsupported_k_quants(path, tensors):
+    counts = {}
+    samples = {}
+    for _, tensor in tensors:
+        qtype = tensor.tensor_type
+        if qtype not in UNSUPPORTED_K_QUANT_TYPES:
+            continue
+        name = qtype_name(qtype)
+        counts[name] = counts.get(name, 0) + 1
+        samples.setdefault(name, [])
+        if len(samples[name]) < 5:
+            samples[name].append(tensor.name)
+
+    if not counts:
+        return
+
+    counts_msg = ", ".join(f"{name} ({count})" for name, count in sorted(counts.items()))
+    sample_msg = "; ".join(
+        f"{name}: {', '.join(names)}" for name, names in sorted(samples.items())
+    )
+    raise ValueError(
+        "Unsupported GGUF K-quant model.\n"
+        f"File: {path}\n"
+        f"Found unsupported _K tensor types: {counts_msg}.\n"
+        f"Examples: {sample_msg}\n\n"
+        "ComfyUI-GGUF no longer supports GGUF _K quants (Q2_K, Q3_K, Q4_K, "
+        "Q5_K, Q6_K). In this loader they must be fully dequantized before "
+        "ordinary PyTorch linear operations, which made inference extremely "
+        "slow and memory intensive. Use a non-K GGUF quant such as Q4_0, "
+        "Q5_0, Q5_1, or Q8_0, or use a dedicated accelerated quantized "
+        "inference backend."
+    )
+
+
 def _plain_tensor(tensor):
     if type(tensor) is torch.Tensor:
         return tensor
@@ -129,6 +156,71 @@ def _reshape_scale_for_weight(scale, weight):
     return scale
 
 
+def _logical_numel(tensor):
+    shape = getattr(tensor, "tensor_shape", tensor.shape)
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
+
+def _tensor_storage_nbytes(tensor):
+    data = getattr(tensor, "data", tensor)
+    return int(data.numel()) * int(data.element_size())
+
+
+def _estimate_fusion_vram_bytes(weight, scale):
+    weight_bytes = _logical_numel(weight) * torch.tensor([], dtype=torch.float32).element_size()
+    scale_bytes = _logical_numel(scale) * torch.tensor([], dtype=torch.float32).element_size()
+    packed_bytes = _tensor_storage_nbytes(weight) + _tensor_storage_nbytes(scale)
+    # Quantized formats allocate intermediate tensors while unpacking. This is
+    # intentionally conservative so the loader chooses CPU before risking OOM.
+    return packed_bytes + scale_bytes + (weight_bytes * 4)
+
+
+def _get_cuda_fusion_budget(device):
+    if device is None or torch.device(device).type != "cuda":
+        return 0
+    try:
+        import comfy.model_management
+        comfy.model_management.soft_empty_cache()
+        free, total = torch.cuda.mem_get_info(device)
+    except Exception:
+        return 0
+
+    safety_margin = max(512 * 1024 * 1024, total // 10)
+    return max(0, int(free) - int(safety_margin))
+
+
+def _select_fusion_device(cuda_device, estimate, remaining_budget):
+    if cuda_device is None or estimate > remaining_budget:
+        return torch.device("cpu"), remaining_budget
+    return cuda_device, remaining_budget - estimate
+
+
+def _fuse_one_weight_scale(state_dict, weight_key, scale_key, compute_device, storage_dtype):
+    scale_float = _as_float32_on_device(state_dict[scale_key], compute_device)
+    weight_float = _as_float32_on_device(state_dict[weight_key], compute_device)
+    scale_float = _reshape_scale_for_weight(scale_float, weight_float)
+
+    try:
+        fused_weight = weight_float * scale_float
+    except torch.OutOfMemoryError:
+        raise
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            raise
+        raise RuntimeError(
+            f"Failed to fuse GGUF scale tensor {scale_key!r} with "
+            f"{weight_key!r}: weight shape {tuple(weight_float.shape)}, "
+            f"scale shape {tuple(scale_float.shape)}"
+        ) from e
+
+    fused_weight = fused_weight.to(device="cpu", dtype=storage_dtype)
+    state_dict[weight_key] = _plain_tensor(fused_weight)
+    del scale_float, weight_float, fused_weight
+
+
 def _fuse_weight_scale_tensors(state_dict):
     scale_keys = [k for k in state_dict.keys() if k.endswith(".weight_scale")]
     if not scale_keys:
@@ -136,11 +228,22 @@ def _fuse_weight_scale_tensors(state_dict):
 
     import comfy.model_management
 
-    compute_device = comfy.model_management.get_torch_device()
+    torch_device = comfy.model_management.get_torch_device()
+    cuda_device = torch.device(torch_device) if torch.device(torch_device).type == "cuda" else None
+    cuda_budget = _get_cuda_fusion_budget(cuda_device)
     storage_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
     fused_count = 0
+    fused_cuda = 0
+    fused_cpu = 0
 
-    logging.info(f"Fusing {len(scale_keys)} GGUF weight scale tensors on {compute_device}.")
+    if cuda_device is not None and cuda_budget > 0:
+        logging.info(
+            f"Fusing {len(scale_keys)} GGUF weight scale tensors with CUDA preflight "
+            f"budget {cuda_budget / (1024 ** 2):.0f} MiB; oversized tensors fall back to CPU."
+        )
+    else:
+        logging.info(f"Fusing {len(scale_keys)} GGUF weight scale tensors on CPU.")
+
     with torch.no_grad():
         for scale_key in tqdm(scale_keys, desc="Fusing weight scales"):
             weight_key = scale_key[:-len("_scale")]
@@ -149,33 +252,42 @@ def _fuse_weight_scale_tensors(state_dict):
                 del state_dict[scale_key]
                 continue
 
-            scale_float = _as_float32_on_device(state_dict[scale_key], compute_device)
-            weight_float = _as_float32_on_device(state_dict[weight_key], compute_device)
-            scale_float = _reshape_scale_for_weight(scale_float, weight_float)
+            estimate = _estimate_fusion_vram_bytes(state_dict[weight_key], state_dict[scale_key])
+            compute_device, cuda_budget = _select_fusion_device(cuda_device, estimate, cuda_budget)
+            if cuda_device is not None and compute_device.type == "cpu" and estimate <= _get_cuda_fusion_budget(cuda_device):
+                cuda_budget = _get_cuda_fusion_budget(cuda_device)
+                compute_device, cuda_budget = _select_fusion_device(cuda_device, estimate, cuda_budget)
 
             try:
-                fused_weight = weight_float * scale_float
-            except RuntimeError as e:
-                raise RuntimeError(
-                    f"Failed to fuse GGUF scale tensor {scale_key!r} with "
-                    f"{weight_key!r}: weight shape {tuple(weight_float.shape)}, "
-                    f"scale shape {tuple(scale_float.shape)}"
-                ) from e
+                _fuse_one_weight_scale(state_dict, weight_key, scale_key, compute_device, storage_dtype)
+                if compute_device.type == "cuda":
+                    fused_cuda += 1
+                else:
+                    fused_cpu += 1
+            except torch.OutOfMemoryError:
+                if compute_device.type != "cuda":
+                    raise
+                logging.warning(f"CUDA OOM while fusing {scale_key}; retrying on CPU.")
+                comfy.model_management.soft_empty_cache()
+                _fuse_one_weight_scale(state_dict, weight_key, scale_key, torch.device("cpu"), storage_dtype)
+                cuda_budget = _get_cuda_fusion_budget(cuda_device)
+                fused_cpu += 1
 
-            fused_weight = fused_weight.to(device="cpu", dtype=storage_dtype)
-            state_dict[weight_key] = _plain_tensor(fused_weight)
             del state_dict[scale_key]
-            del scale_float, weight_float, fused_weight
             fused_count += 1
 
     comfy.model_management.soft_empty_cache()
-    logging.info(f"Fused {fused_count} GGUF weight scale tensors into CPU {storage_dtype} weights.")
+    logging.info(
+        f"Fused {fused_count} GGUF weight scale tensors into CPU {storage_dtype} weights "
+        f"({fused_cuda} CUDA, {fused_cpu} CPU)."
+    )
 
 
 def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False):
     """
     Read state dict as fake tensors
     """
+    logging.info(f"Reading GGUF file: {path}")
     reader = gguf.GGUFReader(path)
 
     # filter and strip prefix
@@ -217,13 +329,20 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     if compat:
         logging.warning(f"Warning: This gguf model file is loaded in compatibility mode '{compat}' [arch:{arch_str}]")
 
+    _raise_for_unsupported_k_quants(path, tensors)
+
     # main loading loop
     # Devices without native bf16 fall back to slow fp32 compute, so load the
     # full-precision BF16 storage tensors as fp16 there instead.
     bf16_storage_dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
     state_dict = {}
     qtype_dict = {}
-    for sd_key, tensor in tensors:
+    tensor_iter = tqdm(
+        tensors,
+        desc=f"Loading GGUF tensors ({os.path.basename(path)})",
+        unit="tensor",
+    )
+    for sd_key, tensor in tensor_iter:
         tensor_name = tensor.name
         # torch_tensor = torch.from_numpy(tensor.data) # mmap
 
@@ -249,11 +368,11 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         # BF16 GGUF tensors are full-precision storage, not compressed quants.
         if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
             dtype = torch.float32 if len(shape) <= 1 else bf16_storage_dtype
-            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=dtype)
+            state_dict[sd_key] = _plain_tensor(dequantize_tensor(state_dict[sd_key], dtype=dtype))
         elif len(shape) <= 1 and is_quantized(state_dict[sd_key]):
             # Norm/scale parameters may use ops that are not GGML-aware. Keep
             # these small tensors as plain floats so PyTorch can load them.
-            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
+            state_dict[sd_key] = _plain_tensor(dequantize_tensor(state_dict[sd_key], dtype=torch.float32))
 
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
