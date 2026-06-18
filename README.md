@@ -1,3 +1,7 @@
+# Comfy UI GGUF - Modified for IDEOGRAM 4
+
+
+
 # ComfyUI-GGUF
 
 GGUF loader nodes for native ComfyUI diffusion models and text encoders.
