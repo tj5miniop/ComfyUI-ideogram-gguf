@@ -1,14 +1,14 @@
 [project]
-name = "comfyui-gguf"
-description = "GGUF Quantization support for native ComfyUI models."
+name = "ComfyUI Ideogram4 GGUF Support for Comfyui"
+description = "GGUF Quantization support, specifically for the IDEOGRAM4 Series of models. - CREDIT to both city96 and molbal - this just minimises the nodes so then both versions of the nodes can work in tandem with eachother."
 version = "2.0.0" # 2.0.0 = GitHub main, 1.X.X = ComfyUI Registry
 license = { file = "LICENSE" }
 dependencies = ["gguf>=0.13.0", "sentencepiece", "protobuf"]
 
 [project.urls]
-Repository = "https://github.com/city96/ComfyUI-GGUF"
+Repository = "https://github.com/tj5miniop/ComfyUI-ideogram-gguf/"
 
 [tool.comfy]
 PublisherId = "city96"
-DisplayName = "ComfyUI-GGUF"
+DisplayName = "ComfyUI-GGUF (IDEOGRAM 4 GGUF)"
 Icon = ""
