@@ -1,4 +1,6 @@
-# Comfy UI GGUF - Modified for IDEOGRAM 4
+# NOTE - based on my testing, this will also work for most other GGUF models which use Quantisations such as Q3, Q4 non K etc
+
+## Comfy UI GGUF - Modified for IDEOGRAM 4 GGUF models 
 
 
 
